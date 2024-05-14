@@ -15,11 +15,12 @@ LINUX_REPO=$(readlink -f $2)
 OUTPATH=$(readlink -f $3)
 ANDROID_COMMITS="kvm_commits_sorted_android.txt"
 LINUX_COMMITS="kvm_commits_sorted_mainline.txt"
-PATCH_LIST="patch_list.txt"
-CANDIDATE_LIST="candidate_list.txt"
+PATCH_LIST="patch.list"
+CANDIDATE_LIST="candidate.list"
+COMBINED_LIST="combined.list"
 COMMITTERS="committers.txt"
-BLACKLISTED_CANDIDATES="android-test-infra-autosubmit@system.gserviceaccount.com"
-BLACKLIST_REGX="kvm\|revert\|selftests\|binder\|gki\|qcom" #kvm included elsewhere
+BLACKLISTED_CANDIDATES="android-test-infra-autosubmit@system.gserviceaccount.com gregkh@linuxfoundation.org"
+BLACKLIST_REGX="kvm\|revert\|selftests\|binder\|gki\|qcom\|KMI"
 
 function get_patches(){
 	cd $1
@@ -34,19 +35,18 @@ function get_patches(){
 	# Take linux release timestamp as a reference (we are not comparing older commits)
 	TIMESTAMP=$(git log  --format=format:"%h %ct %ad %ae \"%s\"" | grep "$LINUX_VERSION_REFERENCE" |  cut -d ' ' -f 2 | head -1)
 
-	# Get git commits from folders indicated by MAINTAINERS file (KERNEL VIRTUAL MACHINE FOR ARM64 (KVM/arm64))
-	git log  --format=format:"%h %ct %ce %ad %ae \"%s\"" --after=$TIMESTAMP arch/arm64/include/asm/kvm* | sed -e '$a\' > kvm_commits.txt 
-	git log  --format=format:"%h %ct %ce %ad %ae \"%s\"" --after=$TIMESTAMP arch/arm64/include/uapi/asm/kvm* | sed -e '$a\' >> kvm_commits.txt
-	git log  --format=format:"%h %ct %ce %ad %ae \"%s\"" --after=$TIMESTAMP arch/arm64/kvm/ | sed -e '$a\' >> kvm_commits.txt
-	git log  --format=format:"%h %ct %ce %ad %ae \"%s\"" --after=$TIMESTAMP include/kvm/arm_* | sed -e '$a\' >> kvm_commits.txt
-	git log  --format=format:"%h %ct %ce %ad %ae \"%s\"" --after=$TIMESTAMP tools/testing/selftests/kvm/*/aarch64/ | sed -e '$a\' >> kvm_commits.txt
-	git log  --format=format:"%h %ct %ce %ad %ae \"%s\"" --after=$TIMESTAMP tools/testing/selftests/kvm/aarch64/ | sed -e '$a\' >> kvm_commits.txt
-
 	# Get all patches that contains kvm (case insensitive) in commit subject
-	git log  --format=format:"%h %ct %ce %ad %ae \"%s\"" --after=$TIMESTAMP | grep 'KVM\|kvm' | sed -e '$a\' >> kvm_commits.txt
+	git log  --reverse --no-merges --format=format:"%h %ct %ce %ad %ae PRIMARY \"%s\"" --after=$TIMESTAMP | grep 'KVM\|kvm' | sed -e '$a\' > kvm_commits.txt
+
+	# Get git commits from folders indicated by MAINTAINERS file (KERNEL VIRTUAL MACHINE FOR ARM64 (KVM/arm64))
+	git log  --reverse --no-merges --format=format:"%h %ct %ce %ad %ae PRIMARY \"%s\"" --after=$TIMESTAMP 	arch/arm64/include/asm/kvm* \
+																						arch/arm64/include/uapi/asm/kvm* \
+																						arch/arm64/kvm/ include/kvm/arm_* \
+																						tools/testing/selftests/kvm/*/aarch64/ \
+																						tools/testing/selftests/kvm/aarch64/ | sed -e '$a\' >> kvm_commits.txt
 
 	# Remove duplicates by commit hashes and sort by commit time (remaining order if same)
-	awk '!seen[$0]++' kvm_commits.txt | sort -b -k 2,2 > $CFD/$2
+	awk '!seen[$0]++' kvm_commits.txt | sort -b -s -k 2,2 > $CFD/$2
 	
 	rm kvm_commits.txt
 }
@@ -58,23 +58,25 @@ function get_candidates(){
 		do
   	  	COMMITTER=${line#* }
   	  	if [[ ! " $BLACKLISTED_CANDIDATES " =~ .*\ $COMMITTER\ .* ]]; then
-			git log  --format=format:"%h %cd %ce %ad %ae \"%s\"" --after=$TIMESTAMP --committer=$COMMITTER --no-merges --grep=$BLACKLIST_REGX --regexp-ignore-case --invert-grep | sed -e '$a\' >> $CFD/$CANDIDATE_LIST
+			git log  --reverse --no-merges --format=format:"%h %ct %ce %ad %ae CANDIDATE \"%s\"" --after=$TIMESTAMP --committer=$COMMITTER | grep -vi $BLACKLIST_REGX | sed -e '$a\' >> $CFD/$CANDIDATE_LIST
   	  	fi
 	done < $2
 }
 
 function create_patches(){
-	if [ ! -d $3 ]; then
-  		mkdir -p $3 
-	fi
-
+	mkdir -p $3/KVM
+  	mkdir -p $3/CANDIDATES
+	
 	cd $1
 	i=0
-	while read line;[ -n "$line" ] 
+	while IFS=' ' read  -r -a VAR;[ -n "$VAR" ] 
 	  do
-  	    COMMIT=${line%% *}
   	    i=$((i+1))
-  	    git format-patch -o $OUTPATH --start-number $i -1 $COMMIT  > /dev/null 2>&1
+  	    if [ "${VAR[10]}" = "PRIMARY" ]; then 
+    		git format-patch -o $3/KVM --start-number $i -1 "${VAR[0]}" > /dev/null 2>&1
+		else
+    		git format-patch -o $3/CANDIDATES --start-number $i -1 "${VAR[0]}" > /dev/null 2>&1
+		fi
 	done < "$2"
 }
 
@@ -92,12 +94,14 @@ cat $CFD/$PATCH_LIST | awk '{print $3}' |sort|uniq -c|sort -n > $CFD/$COMMITTERS
 echo "Get candidates ${ANDROID_REPO}"
 get_candidates $ANDROID_REPO $CFD/$COMMITTERS
 
+cat $CFD/*.list | awk '!seen[$0]++' | sort -b -s -k 2,2 > $CFD/$COMBINED_LIST
+
 # Extract patches from android repo
 echo "Create patches"
-create_patches $ANDROID_REPO $CFD/$PATCH_LIST $OUTPATH
-create_patches $ANDROID_REPO $CFD/$CANDIDATE_LIST $CFD/CANDIDATES
+create_patches $ANDROID_REPO $CFD/$COMBINED_LIST $OUTPATH
 
 rm $CFD/$ANDROID_COMMITS
 rm $CFD/$LINUX_COMMITS
+rm $CFD/$COMMITTERS
 
 cd $CFD
